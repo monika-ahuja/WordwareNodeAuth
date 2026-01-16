@@ -2,6 +2,9 @@ const router = require('express').Router();
 const Organization = require('../Models/Organization');
 const Project = require('../Models/Project');
 const jwt = require('jsonwebtoken');
+const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
 
 const JWT_SECRET = "MY_SUPER_SECRET_KEY";
 
@@ -39,6 +42,52 @@ router.post('/projects', authMiddleware, async (req, res) => {
       owner: userId
     });
 
+    // Create project directory
+    const projectDir = path.join(__dirname, '..', 'projects', project._id.toString());
+    if (!fs.existsSync(projectDir)) {
+      fs.mkdirSync(projectDir, { recursive: true });
+    }
+
+    // Prepare project data for pickle file
+    const projectData = {
+      id: project._id.toString(),
+      name: project.name,
+      org: org._id.toString(),
+      owner: userId,
+      createdAt: project.createdAt
+    };
+
+    // Execute Python script to create pickle file
+    const pythonScriptPath = path.join(__dirname, '..', 'create_pickle.py');
+    const pythonProcess = spawn('python', [
+      pythonScriptPath,
+      JSON.stringify(projectData)
+    ], {
+      cwd: projectDir
+    });
+
+    let pythonOutput = '';
+    pythonProcess.stdout.on('data', (data) => {
+      pythonOutput += data.toString();
+      console.log('Python output:', data.toString());
+    });
+
+    pythonProcess.stderr.on('data', (data) => {
+      console.error('Python error:', data.toString());
+    });
+
+    pythonProcess.on('error', (err) => {
+      console.error('Failed to spawn Python process:', err);
+    });
+
+    pythonProcess.on('close', (code) => {
+      if (code === 0) {
+        console.log('Pickle file created successfully for project:', project._id);
+      } else {
+        console.error('Pickle file creation failed with exit code:', code);
+      }
+    });
+
     res.json(project);
   } catch (err) {
     console.error('CREATE PROJECT ERROR:', err);
@@ -46,6 +95,81 @@ router.post('/projects', authMiddleware, async (req, res) => {
   }
 });
 
+
+// Check if pickle file exists
+router.get('/o/:orgSlug/proj_:projectId/pickle-status', authMiddleware, async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    
+    const picklePath = path.join(__dirname, '..', 'projects', projectId, 'data.pkl');
+    const exists = fs.existsSync(picklePath);
+    
+    if (exists) {
+      const stats = fs.statSync(picklePath);
+      res.json({
+        status: 'success',
+        message: 'Pickle file exists',
+        exists: true,
+        file: {
+          path: picklePath,
+          size: stats.size,
+          createdAt: stats.birthtime,
+          modifiedAt: stats.mtime
+        }
+      });
+    } else {
+      res.json({
+        status: 'pending',
+        message: 'Pickle file not found yet (may still be creating)',
+        exists: false,
+        path: picklePath
+      });
+    }
+  } catch (err) {
+    console.error('PICKLE STATUS ERROR:', err);
+    res.status(500).json({ message: 'Internal server error', error: err.message });
+  }
+});
+
+// Get pickle file contents as JSON
+router.get('/o/:orgSlug/proj_:projectId/pickle-data', authMiddleware, async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const picklePath = path.join(__dirname, '..', 'projects', projectId, 'data.pkl');
+    
+    // Check if file exists
+    if (!fs.existsSync(picklePath)) {
+      return res.status(404).json({
+        status: 'not_found',
+        message: 'Pickle file does not exist yet',
+        path: picklePath
+      });
+    }
+    
+    // Use Python to read pickle file
+    const { execSync } = require('child_process');
+    const pythonCode = `import pickle; import json; f = open('${picklePath}', 'rb'); data = pickle.load(f); f.close(); print(json.dumps(data, default=str))`;
+    
+    const result = execSync(`python -c "${pythonCode}"`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    
+    const data = JSON.parse(result);
+    
+    res.json({
+      status: 'success',
+      message: 'Pickle file data retrieved',
+      data: data
+    });
+  } catch (err) {
+    console.error('PICKLE READ ERROR:', err);
+    res.status(500).json({ 
+      message: 'Error reading pickle file', 
+      error: err.message 
+    });
+  }
+});
 
 // Get projects
 router.get('/o/:orgSlug/projects', authMiddleware, async (req, res) => {
